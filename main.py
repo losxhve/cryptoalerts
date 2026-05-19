@@ -9,7 +9,8 @@ import httpx
 import asyncio
 import hashlib
 import os
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -31,8 +32,8 @@ PLANS = {
     "max":  {"alerts": 999, "interval": 15, "price_usd": 29.99},
 }
 # 收款钱包地址
-PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "0xe19bae7f849f9a21cc621b832aaa42c1341a36fb")
-PAYMENT_CHAIN = os.getenv("PAYMENT_CHAIN", "ETH")
+PAYMENT_WALLET = os.getenv("PAYMENT_WALLET", "TBzeBcdaEGvS2FLnW7wjHuN19RqUaVpFHH")
+PAYMENT_CHAIN = os.getenv("PAYMENT_CHAIN", "TRC-20 (USDT)")
 # 用于验证付款的OKX API（可选）
 OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 
@@ -45,6 +46,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE,
+            password_hash TEXT,
+            token TEXT,
             telegram_chat_id TEXT,
             plan TEXT DEFAULT 'free',
             plan_expires TEXT,
@@ -218,21 +222,106 @@ async def get_coins():
     """获取支持的币种列表"""
     return [{"id": k, "symbol": v} for k, v in SUPPORTED_COINS.items()]
 
+# ========== 认证 ==========
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_token() -> str:
+    return secrets.token_hex(32)
+
+@app.post("/api/auth/register")
+async def auth_register(request: Request):
+    """邮箱+密码注册"""
+    data = await request.json()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    username = data.get("username", email.split("@")[0])
+    
+    if not email or "@" not in email:
+        raise HTTPException(400, "请输入有效邮箱")
+    if len(password) < 6:
+        raise HTTPException(400, "密码至少6位")
+    
+    conn = get_db()
+    existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(400, "该邮箱已注册")
+    
+    token = generate_token()
+    conn.execute(
+        "INSERT INTO users (username, email, password_hash, token) VALUES (?, ?, ?, ?)",
+        (username, email, hash_password(password), token)
+    )
+    conn.commit()
+    user_id = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()[0]
+    conn.close()
+    return {"user_id": user_id, "username": username, "email": email, "token": token, "plan": "free"}
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request):
+    """邮箱+密码登录"""
+    data = await request.json()
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    
+    conn = get_db()
+    user = conn.execute(
+        "SELECT id, username, email, password_hash, plan, plan_expires FROM users WHERE email = ?",
+        (email,)
+    ).fetchone()
+    
+    if not user or user["password_hash"] != hash_password(password):
+        conn.close()
+        raise HTTPException(401, "邮箱或密码错误")
+    
+    token = generate_token()
+    conn.execute("UPDATE users SET token = ? WHERE id = ?", (token, user["id"]))
+    conn.commit()
+    conn.close()
+    return {
+        "user_id": user["id"], "username": user["username"],
+        "email": user["email"], "token": token, "plan": user["plan"]
+    }
+
+@app.post("/api/auth/check")
+async def auth_check(request: Request):
+    """验证token是否有效"""
+    data = await request.json()
+    token = data.get("token", "")
+    if not token:
+        raise HTTPException(401, "未登录")
+    conn = get_db()
+    user = conn.execute(
+        "SELECT id, username, email, plan FROM users WHERE token = ?", (token,)
+    ).fetchone()
+    conn.close()
+    if not user:
+        raise HTTPException(401, "登录已过期")
+    return dict(user)
+
 @app.post("/api/register")
 async def register(request: Request):
-    """用户注册"""
+    """用户注册/登录（兼容旧版无密码模式）"""
     data = await request.json()
     username = data.get("username")
     if not username:
         raise HTTPException(400, "username required")
     
     conn = get_db()
+    # 检查用户是否存在 → 登录
+    existing = conn.execute("SELECT id, plan, plan_expires FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        conn.close()
+        return {"user_id": existing["id"], "username": username, "plan": existing["plan"], "is_new": False}
+    
+    # 不存在 → 注册新用户
     try:
         conn.execute("INSERT INTO users (username) VALUES (?)", (username,))
         conn.commit()
         user_id = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
         conn.close()
-        return {"user_id": user_id, "username": username}
+        return {"user_id": user_id, "username": username, "plan": "free", "is_new": True}
     except sqlite3.IntegrityError:
         conn.close()
         raise HTTPException(400, "username already exists")
@@ -451,18 +540,35 @@ INDEX_HTML = """<!DOCTYPE html>
             <p>实时加密货币监控 · Telegram 告警推送</p>
         </header>
 
-        <div class="user-setup">
-            <h2>👤 用户设置</h2>
-            <div class="form-group">
-                <div>
-                    <label>用户名</label>
-                    <input type="text" id="username" placeholder="输入用户名" value="user1">
-                </div>
-                <button class="btn-primary" onclick="register()">注册/登录</button>
-                <span id="userStatus" style="color:#94a3b8;font-size:14px;align-self:center;"></span>
+        <div class="user-setup" id="authSection">
+            <div style="display:flex;gap:16px;align-items:center;margin-bottom:16px;">
+                <h2 style="margin:0;">🔐 登录</h2>
+                <span id="authToggle" style="color:#3b82f6;cursor:pointer;font-size:14px;" onclick="toggleAuth()">没有账号？去注册</span>
             </div>
-            <div class="telegram-guide">
-                📱 绑定 Telegram：搜索 <code>@CryptoAlertsBot</code> → 发送 <code>/start</code> → 输入上面用户名完成绑定
+            <div id="authForm">
+                <div class="form-group">
+                    <div style="flex:1;">
+                        <label>邮箱</label>
+                        <input type="email" id="authEmail" style="width:100%;" placeholder="your@email.com">
+                    </div>
+                    <div style="flex:1;">
+                        <label>密码</label>
+                        <input type="password" id="authPassword" style="width:100%;" placeholder="至少6位">
+                    </div>
+                    <button class="btn-primary" id="authBtn" onclick="doLogin()">登录</button>
+                </div>
+            </div>
+            <div id="userInfo" style="display:none;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <span style="font-size:18px;font-weight:600;" id="displayEmail"></span>
+                        <span style="font-size:14px;color:#94a3b8;margin-left:8px;" id="displayPlan"></span>
+                    </div>
+                    <button style="background:#475569;color:white;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:13px;" onclick="logout()">退出</button>
+                </div>
+            </div>
+            <div class="telegram-guide" style="margin-top:12px;">
+                📱 绑定 Telegram：搜索 <code>@CryptoAlertsBot</code> → 发送 <code>/start</code> → 输入你的邮箱完成绑定
             </div>
         </div>
 
@@ -537,12 +643,75 @@ INDEX_HTML = """<!DOCTYPE html>
 
     <script>
         let currentUserId = null;
+        let currentToken = localStorage.getItem('crypto_token') || '';
         let prices = {};
+        let isLoginMode = true;
+
+        function toggleAuth() {
+            isLoginMode = !isLoginMode;
+            document.getElementById('authBtn').textContent = isLoginMode ? '登录' : '注册';
+            document.getElementById('authToggle').textContent = isLoginMode ? '没有账号？去注册' : '已有账号？去登录';
+        }
+
+        async function doLogin() {
+            const email = document.getElementById('authEmail').value.trim();
+            const password = document.getElementById('authPassword').value.trim();
+            if (!email || !password) return showToast('请填写邮箱和密码', 'error');
+            
+            const endpoint = isLoginMode ? '/api/auth/login' : '/api/auth/register';
+            const res = await api(endpoint, { method: 'POST', body: JSON.stringify({email, password}) });
+            if (res && res.token) {
+                currentUserId = res.user_id;
+                currentToken = res.token;
+                localStorage.setItem('crypto_token', res.token);
+                localStorage.setItem('crypto_email', email);
+                showAuthSuccess(res);
+                showToast('登录成功 🎉');
+                loadAlerts();
+            }
+        }
+
+        async function checkAuth() {
+            if (!currentToken) return;
+            const res = await api('/api/auth/check', { method: 'POST', body: JSON.stringify({token: currentToken}) });
+            if (res && res.id) {
+                currentUserId = res.id;
+                showAuthSuccess({...res, email: res.email || localStorage.getItem('crypto_email')});
+                loadAlerts();
+            } else {
+                localStorage.removeItem('crypto_token');
+            }
+        }
+
+        function showAuthSuccess(res) {
+            document.getElementById('authForm').style.display = 'none';
+            document.getElementById('authToggle').style.display = 'none';
+            document.getElementById('userInfo').style.display = 'block';
+            document.getElementById('displayEmail').textContent = res.email || '已登录';
+            document.getElementById('displayPlan').textContent = `(${res.plan || 'free'})`;
+        }
+
+        function logout() {
+            currentToken = '';
+            currentUserId = null;
+            localStorage.removeItem('crypto_token');
+            localStorage.removeItem('crypto_email');
+            document.getElementById('authForm').style.display = 'block';
+            document.getElementById('authToggle').style.display = 'inline';
+            document.getElementById('userInfo').style.display = 'none';
+            document.getElementById('alertTable').innerHTML = '<tr><td colspan="6" class="empty">请先登录</td></tr>';
+            showToast('已退出');
+        }
 
         async function api(url, opts = {}) {
             try {
                 const resp = await fetch(url, { headers: {'Content-Type': 'application/json'}, ...opts });
-                return await resp.json();
+                const data = await resp.json();
+                if (!resp.ok) {
+                    showToast(data.detail || '请求失败', 'error');
+                    return null;
+                }
+                return data;
             } catch(e) { showToast('网络错误: ' + e.message, 'error'); return null; }
         }
 
@@ -677,8 +846,7 @@ INDEX_HTML = """<!DOCTYPE html>
         loadCoins();
         loadPrices();
         setInterval(loadPrices, 30000);
-        // 自动注册默认用户
-        setTimeout(register, 500);
+        checkAuth();
     </script>
 </body>
 </html>
