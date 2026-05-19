@@ -1,0 +1,13 @@
+# CryptoAlerts - 部署配置
+# 推送到 GitHub 后关联 Render/Railway 自动部署
+
+services:
+  - type: web
+    name: cryptoalerts
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: ""  # 部署时填写你的 Telegram Bot Token
+    plan: free
